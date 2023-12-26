@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+     <PropertyGroup>
+          <TargetFramework>net8.0</TargetFramework>
+          <Nullable>enable</Nullable>
+          <Platforms>x86;x64;ARM64</Platforms>
+          <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
+
+          <Version>0.1.0</Version>
+
+          <Copyright>Copyright (c) ScaleFS LLC</Copyright>
+          <PackageLicenseExpression>MIT</PackageLicenseExpression>
+          <RepositoryUrl>https://github.com/scalefs/scalefs-windowspnp-lib-cs</RepositoryUrl>
+     </PropertyGroup>
+
+</Project>
