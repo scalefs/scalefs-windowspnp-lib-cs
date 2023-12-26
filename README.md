@@ -1,2 +1,2 @@
 # scalefs-windowspnp-lib-cs
-ScaleFS.WindowsPnP library (C#)
+ScaleFS.WindowsPnp library (C#)
