@@ -19,10 +19,7 @@
                <!-- NOTE: the following entry was removed per the recommendation of Microsoft.Windows.CsWin32's readme.txt -->
                <!--<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>-->
           </PackageReference>
-     </ItemGroup>
-
-     <ItemGroup>
-       <ProjectReference Include="..\..\scalefs-primitives-lib-cs\src\ScaleFS.Primitives.csproj" />
+          <PackageReference Include="ScaleFS.Primitives" Version="0.1.0" />
      </ItemGroup>
 
 </Project>
