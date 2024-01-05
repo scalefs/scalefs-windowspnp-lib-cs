@@ -175,6 +175,7 @@ public class PnpEnumerator
                     switch (getDeviceInstanceIdFromDevinfoDataResult.Error!)
                     {
                         case IGetDeviceInstanceIdFromDevinfoDataError.StringDecodingError { }:
+                            Debug.Assert(false, "Invalid string encoding when attempting to get the device instance id");
                             return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringDecodingError());
                         case IGetDeviceInstanceIdFromDevinfoDataError.Win32Error { Win32ErrorCode: var win32ErrorCode }:
                             return Result.ErrorResult<IEnumerateDevicesError>(IEnumerateDevicesError.FromIWin32Error(IWin32Error.FromInt32(win32ErrorCode)));
@@ -187,7 +188,7 @@ public class PnpEnumerator
                 // for all devices: capture the base container id of the device
                 //
                 // NOTE: we could probably also get this data using the modern setup API by retrieving the device instance property "DEVPKEY_Device_BaseContainerId"...which might be preferable to using the legacy device registry property value mechanism; note that its type is GUID instead of String
-                // NOTE: SPDRP_BASE_CONTAINERID is not listed as an allowed property at https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceregistrypropertyw -- this may an additional reason to look at transitioning this call to the modern setup API
+                // NOTE: SPDRP_BASE_CONTAINERID is not listed as an allowed property at https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceregistrypropertyw -- this may be an additional reason to look at transitioning this call to the modern setup API
                 var getDeviceRegistryPropertyValueResult = PnpEnumerator.GetDeviceRegistryPropertyValue(handleToDeviceInfoSet, devinfoData, Windows.Win32.PInvoke.SPDRP_BASE_CONTAINERID);
                 if (getDeviceRegistryPropertyValueResult.IsError)
                 {
@@ -234,23 +235,399 @@ public class PnpEnumerator
                         Debug.Assert(false, "GetDeviceRegistryPropertyValue returned a non-string value for SPDRP_BASE_CONTAINERID");
                         return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error((ushort)Windows.Win32.Foundation.WIN32_ERROR.ERROR_INVALID_DATA));
                 };
+				
+                // NOTE: to capture the device manufacturer, device description and device friendly name strings, optionally use PnpEnumerator.GetDeviceRegistryPropertyValue(...) to capture the following:
+                // - SPDRP_MFG - PnpDevicePropertyValue.String(...) - "manufacturer" (not necessarily the Manufacturer from the USB device descriptor)
+                // - SPDRP_DEVICEDESC - PnpDevicePropertyValue.String(...) - bus-provided "device description" (not necessarily the Product string from the USB device descriptor, although it matched when we test against one _container_ device instances); this might be missing/null for many devices... (TBD)
+                // - SPDRP_FRIENDLYNAME - PnpDevicePropertyValue.String(...) - "friendly name" used to refer to the device; this might be the string shown in Device Manager for a devnode, it might include additional data such as a port #, etc. (TBD)
+
+                // capture the device instance properties (and, where applicable/available, the device class and device interface properties)
+
+                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceInstanceProperties;
+                if (includeInstanceProperties == true)
+                {
+                    var getDeviceInstancePropertyKeysResult = PnpEnumerator.GetDeviceInstancePropertyKeys(handleToDeviceInfoSet, devinfoData);
+                    if (getDeviceInstancePropertyKeysResult.IsError)
+                    {
+                        switch (getDeviceInstancePropertyKeysResult.Error!)
+                        {
+                            case IWin32Error.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                Debug.Assert(false, "BUG: could not get list of available property keys for the device instance");
+                                return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                            default:
+                                throw new Exception("invalid code path");
+                        }
+                    }
+                    var availableDeviceInstancePropertyKeys = getDeviceInstancePropertyKeysResult.Value!;
+
+                    deviceInstanceProperties = new();
+                    foreach (var propertyKey in availableDeviceInstancePropertyKeys)
+                    {
+                        var propertyKeyAsPnpDevicePropertyKey = PnpDevicePropertyKey.From(propertyKey);
+                        var getDeviceInstancePropertyValueResult = PnpEnumerator.GetDeviceInstancePropertyValue(handleToDeviceInfoSet, devinfoData, propertyKeyAsPnpDevicePropertyKey);
+                        if (getDeviceInstancePropertyValueResult.IsError)
+                        {
+                            switch (getDeviceInstancePropertyValueResult.Error!)
+                            {
+                                case IGetDevicePropertyValueError.StringDecodingError:
+                                    return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringDecodingError());
+                                case IGetDevicePropertyValueError.StringListTerminationError:
+                                    Debug.Assert(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                    return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                case IGetDevicePropertyValueError.StringTerminationError:
+                                    Debug.Assert(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                    return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                case IGetDevicePropertyValueError.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                    return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                default:
+                                    throw new Exception("invalid code path");
+                            }
+                        }
+                        var propertyValue = getDeviceInstancePropertyValueResult.Value!;
+
+                        deviceInstanceProperties?.Add(propertyKeyAsPnpDevicePropertyKey, propertyValue);
+                    }
+                }
+                else
+                {
+                    // do not enumerate the device instance properties (EnumerateOption::IncludeInstanceProperties omitted)
+                    deviceInstanceProperties = null;
+                }
+                
+                //
+
+                // option: capture the device setup class guid and device setup class properties for this devnode
+
+                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceSetupClassProperties;
+                if (includeSetupClassProperties == true)
+                {
+                    // for all devices: capture the device setup class guid of the device
+                    string? deviceSetupClassGuidAsString;
+                    // NOTE: we might be able to get this data using the modern setup API by retrieving the device instance property "DEVPKEY_Device_ClassGuid"...which might be preferable to using the legacy device registry property value mechanism; note that we have not tested that DEVPKEY on interfaces
+                    getDeviceRegistryPropertyValueResult = PnpEnumerator.GetDeviceRegistryPropertyValue(handleToDeviceInfoSet, devinfoData, Windows.Win32.PInvoke.SPDRP_CLASSGUID);
+                    if (getDeviceRegistryPropertyValueResult.IsError)
+                    {
+                        switch (getDeviceRegistryPropertyValueResult.Error!)
+                        {
+                            case IGetDevicePropertyValueError.StringDecodingError:
+                                return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringDecodingError());
+                            case IGetDevicePropertyValueError.StringListTerminationError:
+                                Debug.Assert(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                            case IGetDevicePropertyValueError.StringTerminationError:
+                                Debug.Assert(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                            case IGetDevicePropertyValueError.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                {
+                                    if ((Windows.Win32.Foundation.WIN32_ERROR)win32ErrorCode == Windows.Win32.Foundation.WIN32_ERROR.ERROR_INVALID_DATA)
+                                    {
+                                        // this is an expected error for root nodes; proceed
+                                        deviceSetupClassGuidAsString = null;
+                                        // NOTE: we may want to determine if the node was the root node (so that we don't simply omit device class properties in the wrong situations)
+                                        break;
+                                    }
+                                    else
+                                    {
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                    }
+                                }
+                            default:
+                                throw new Exception("invalid code path");
+                        }
+                    }
+                    else
+                    {
+                        switch (getDeviceRegistryPropertyValueResult.Value!)
+                        {
+                            case IPnpDevicePropertyValue.String { Value: var value }:
+                                deviceSetupClassGuidAsString = value;
+                                break;
+                            default:
+                                deviceSetupClassGuidAsString = null;
+                                break;
+                        }
+                    }
+                    //
+                    Guid? deviceSetupClassGuid;
+                    if (deviceSetupClassGuidAsString is not null)
+                    {
+                        Guid deviceSetupClassGuidAsGuid;
+                        var parseSuccess = Guid.TryParse(deviceSetupClassGuidAsString, out deviceSetupClassGuidAsGuid);
+                        if (parseSuccess == true)
+                        {
+                            deviceSetupClassGuid = deviceSetupClassGuidAsGuid;
+                        }
+                        else
+                        {
+                            deviceSetupClassGuid = null;
+                        }
+                    }
+                    else
+                    {
+                        deviceSetupClassGuid = null;
+                    }
+                    //
+                    // if a setup class GUID was provided with this function, override device_setup_class_guid (although they SHOULD be identical)
+                    if (enumerateSpecifier is IPnpEnumerateSpecifier.DeviceSetupClassGuid { SetupClassGuid: var setupClassGuid })
+                    {
+                        if (deviceSetupClassGuid is null)
+                        {
+                            Debug.Assert(false, "Device setup class GUID provided to the enumeration function does not match the device setup class guid enumerated from the devnode");
+                        }
+                        else
+                        {
+                            if (setupClassGuid.Equals(deviceSetupClassGuid!) == false)
+                            {
+                                Debug.Assert(false, "Device setup class GUID provided to the enumeration function does not match the device setup class guid enumerated from the devnode");
+                            }
+                        }
+                        deviceSetupClassGuid = setupClassGuid;
+                    }
+
+                    //
+
+                    if (deviceSetupClassGuid is not null)
+                    {
+                        var getDeviceClassPropertyKeysResult = PnpEnumerator.GetDeviceClassPropertyKeys(deviceSetupClassGuid.Value!, DeviceClassType.DeviceSetupClass);
+                        if (getDeviceClassPropertyKeysResult.IsError)
+                        {
+                            switch (getDeviceClassPropertyKeysResult.Error!)
+                            {
+                                case IWin32Error.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                    Debug.Assert(false, "BUG: could not get list of available property keys for the device setup class");
+                                    return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                default:
+                                    throw new Exception("invalid code path");
+                            }
+                        }
+                        var availableDeviceSetupClassPropertyKeys = getDeviceClassPropertyKeysResult.Value!;
+
+                        deviceSetupClassProperties = new();
+                        foreach (var propertyKey in availableDeviceSetupClassPropertyKeys)
+                        {
+                            var propertyKeyAsPnpDevicePropertyKey = PnpDevicePropertyKey.From(propertyKey);
+                            var getDeviceClassPropertyValueResult = PnpEnumerator.GetDeviceClassPropertyValue(deviceSetupClassGuid.Value!, DeviceClassType.DeviceSetupClass, propertyKeyAsPnpDevicePropertyKey);
+                            if (getDeviceClassPropertyValueResult.IsError)
+                            {
+                                switch (getDeviceClassPropertyValueResult.Error!)
+                                {
+                                    case IGetDevicePropertyValueError.StringDecodingError:
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringDecodingError());
+                                    case IGetDevicePropertyValueError.StringListTerminationError:
+                                        Debug.Assert(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                    case IGetDevicePropertyValueError.StringTerminationError:
+                                        Debug.Assert(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                    case IGetDevicePropertyValueError.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                    default:
+                                        throw new Exception("invalid code path");
+                                }
+                            }
+                            var propertyValue = getDeviceClassPropertyValueResult.Value!;
+
+                            deviceSetupClassProperties.Add(propertyKeyAsPnpDevicePropertyKey, propertyValue);
+                        }
+                    }
+                    else
+                    {
+                        deviceSetupClassProperties = null;
+                    }
+                }
+                else
+                {
+                    // do not enumerate the device setup class properties (PnpEnumerateOption.IncludeDeviceSetupClassProperties omitted)
+                    deviceSetupClassProperties = null;
+                }
 
                 //
+
+                // option: capture the device interface class properties for this devnode
+
+                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceInterfaceClassProperties;
+                if (includeDeviceInterfaceClassProperties == true)
+                {
+                    if (deviceInterfaceClassGuid is not null)
+                    {
+                        var getDeviceClassPropertyKeysResult = PnpEnumerator.GetDeviceClassPropertyKeys(deviceInterfaceClassGuid.Value!, DeviceClassType.DeviceInterfaceClass);
+                        if (getDeviceClassPropertyKeysResult.IsError)
+                        {
+                            switch (getDeviceClassPropertyKeysResult.Error!)
+                            {
+                                case IWin32Error.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                    Debug.Assert(false, "BUG: could not get list of available property keys for the device interface class");
+                                    return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                default:
+                                    throw new Exception("invalid code path");
+                            }
+                        }
+                        var availableDeviceInterfaceClassPropertyKeys = getDeviceClassPropertyKeysResult.Value!;
+
+                        deviceInterfaceClassProperties = new();
+                        foreach (var propertyKey in availableDeviceInterfaceClassPropertyKeys)
+                        {
+                            var propertyKeyAsPnpDevicePropertyKey = PnpDevicePropertyKey.From(propertyKey);
+                            var getDeviceInterfacePropertyValueResult = PnpEnumerator.GetDeviceClassPropertyValue(deviceInterfaceClassGuid.Value!, DeviceClassType.DeviceInterfaceClass, propertyKeyAsPnpDevicePropertyKey);
+                            if (getDeviceInterfacePropertyValueResult.IsError)
+                            {
+                                switch (getDeviceInterfacePropertyValueResult.Error!)
+                                {
+                                    case IGetDevicePropertyValueError.StringDecodingError:
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringDecodingError());
+                                    case IGetDevicePropertyValueError.StringListTerminationError:
+                                        Debug.Assert(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                    case IGetDevicePropertyValueError.StringTerminationError:
+                                        Debug.Assert(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                    case IGetDevicePropertyValueError.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                    default:
+                                        throw new Exception("invalid code path");
+                                }
+                            }
+                            var propertyValue = getDeviceInterfacePropertyValueResult.Value!;
+
+                            deviceInterfaceClassProperties.Add(propertyKeyAsPnpDevicePropertyKey, propertyValue);
+                        }
+                    }
+                    else
+                    {
+                        deviceInterfaceClassProperties = null;
+                    }
+                }
+                else
+                {
+                    // do not enumerate the device interface class properties (PnpEnumerateOption.IncludeDeviceInterfaceClassProperties omitted)
+                    deviceInterfaceClassProperties = null;
+                }
+
                 //
+
+                // determine if this devnode is a device interface; if it is, capture its path and its device interface property values
+                bool devnodeIsDeviceInterface;
                 //
+                // get the device interface details for this device
+                Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DATA deviceInterfaceData = new() { cbSize = (uint)Marshal.SizeOf<Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DATA>() };
                 //
+                bool enumDeviceInterfacesResult;
+                if (deviceInterfaceClassGuid is not null)
+                {
+                    // retrieve an SP_DEVICE_INTERFACE_DATA instance which identifies an interface which meets our search criteria
+                    // https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdienumdeviceinterfaces
+                    enumDeviceInterfacesResult = Windows.Win32.PInvoke.SetupDiEnumDeviceInterfaces(handleToDeviceInfoSet, null, deviceInterfaceClassGuid.Value!, deviceIndex, ref deviceInterfaceData);
+
+                    if (enumDeviceInterfacesResult == false)
+                    {
+                        var win32ErrorCode = Marshal.GetLastWin32Error();
+                        switch ((Windows.Win32.Foundation.WIN32_ERROR)win32ErrorCode)
+                        {
+                            case Windows.Win32.Foundation.WIN32_ERROR.ERROR_NO_MORE_ITEMS:
+                                {
+                                    // we have reached the end of our list successfully OR this devnode is not a device interface; proceed
+                                    devnodeIsDeviceInterface = false;
+                                    break;
+                                }
+                            default:
+                                return Result.ErrorResult<IEnumerateDevicesError>(IEnumerateDevicesError.FromIWin32Error(IWin32Error.FromInt32(win32ErrorCode)));
+                        }
+                    }
+                    else
+                    {
+                        devnodeIsDeviceInterface = true;
+                    }
+                }
+                else
+                {
+                    // NOTE: without a supplied device interface class guid, we cannot call SetupDiEnumDeviceInterfaces to extract the device path or other information
+                    //       [if we can find a way to obtain this GUID in the future without asking the user for it, we should do so...and then use it here.]
+                    devnodeIsDeviceInterface = false;
+                    // NOTE: the following code is just an example of a call which _won't_ work, since an empty ("nil") guid is not a valid interface guid (or is a hub guid...which is just wrong); don't do this...
+                    // let zeroedGuid = Guid.Empty;
+                    // enumDeviceInterfacesResult = SetupDiEnumDeviceInterfaces(handleToDeviceInfoSet, null, zeroedGuid, deviceIndex, ref deviceInterfaceData);
+                }
+
+                string? devicePath;
+                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceInterfaceProperties;
                 //
-                // TODO: capture values for all the other PnpDeviceNodeInfo elements; in the meantime, here are empty fillers
-                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceInstanceProperties = null;
-                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceSetupClassProperties = null;
-                string? devicePath = null;
-                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceInterfaceProperties = null;
-                Dictionary<PnpDevicePropertyKey, IPnpDevicePropertyValue>? deviceInterfaceClassProperties = null;
-                //
-                //
-                //
-                //
-                //
+                if (devnodeIsDeviceInterface == true)
+                {
+                    // capture the path for this device interface
+                    var getDevicePathResult = PnpEnumerator.GetDevicePathFromDeviceInterfaceDetailData(handleToDeviceInfoSet, ref deviceInterfaceData);
+                    if (getDevicePathResult.IsError)
+                    {
+                        switch (getDevicePathResult.Error!)
+                        {
+                            case IWin32Error.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                {
+                                    return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                }
+                            default:
+                                throw new Exception("invalid code path");
+                        }
+                    }
+                    devicePath = getDevicePathResult.Value!;
+
+                    if (includeDeviceInterfaceProperties == true)
+                    {
+                        // capture the device interface property keys for this device interface
+                        var getDeviceInterfacePropertyKeysResult = PnpEnumerator.GetDeviceInterfacePropertyKeys(handleToDeviceInfoSet, deviceInterfaceData);
+                        if (getDeviceInterfacePropertyKeysResult.IsError)
+                        {
+                            switch (getDevicePathResult.Error!)
+                            {
+                                case IWin32Error.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                    {
+                                        Debug.Assert(false, "BUG: could not get list of available property keys for the device interface");
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                    }
+                                default:
+                                    throw new Exception("invalid code path");
+                            }
+                        }
+                        var availableDeviceInterfacePropertyKeys = getDeviceInterfacePropertyKeysResult.Value!;
+                        //
+                        deviceInterfaceProperties = new();
+                        foreach (var propertyKey in availableDeviceInterfacePropertyKeys)
+                        {
+                            var propertyKeyAsPnpDevicePropertyKey = PnpDevicePropertyKey.From(propertyKey);
+                            var getDeviceInterfacePropertyValueResult = PnpEnumerator.GetDeviceInterfacePropertyValue(handleToDeviceInfoSet, deviceInterfaceData, propertyKeyAsPnpDevicePropertyKey);
+                            if (getDeviceInterfacePropertyValueResult.IsError)
+                            {
+                                switch (getDeviceInterfacePropertyValueResult.Error!)
+                                {
+                                    case IGetDevicePropertyValueError.StringDecodingError:
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringDecodingError());
+                                    case IGetDevicePropertyValueError.StringListTerminationError:
+                                        Debug.Assert(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                    case IGetDevicePropertyValueError.StringTerminationError:
+                                        Debug.Assert(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.StringTerminationDecodingError());
+                                    case IGetDevicePropertyValueError.Win32Error { Win32ErrorCode: var win32ErrorCode }:
+                                        return Result.ErrorResult<IEnumerateDevicesError>(new IEnumerateDevicesError.Win32Error(win32ErrorCode));
+                                    default:
+                                        throw new Exception("invalid code path");
+                                }
+                            }
+                            var propertyValue = getDeviceInterfacePropertyValueResult.Value!;
+
+                            deviceInterfaceProperties.Add(propertyKeyAsPnpDevicePropertyKey, propertyValue);
+                        }
+                    }
+                    else
+                    {
+                        // do not enumerate the device interface properties (EnumerateOption::IncludeDeviceInterfaceProperties omitted)
+                        deviceInterfaceProperties = null;
+                    }
+                }
+                else
+                {
+                    // this devnode is not a device interface, so it has no device path or device instance properties
+                    devicePath = null;
+                    deviceInterfaceProperties = null;
+                }
 
                 // add this device node's info to our result list
                 var deviceNodeInfo = new PnpDeviceNodeInfo()
@@ -377,6 +754,147 @@ public class PnpEnumerator
 
     //
 
+    enum DeviceClassType
+    {
+        DeviceSetupClass,
+        DeviceInterfaceClass,
+    }
+
+    //
+
+    private static Result<Unit, IWin32Error> CheckSetupDiGetXXXPropertyKeysRequiredSizeResult(bool setupDiGetXXXPropertyKeysResult, uint requiredPropertyKeyCount)
+    {
+        if (setupDiGetXXXPropertyKeysResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            if ((Windows.Win32.Foundation.WIN32_ERROR)win32ErrorCode == Windows.Win32.Foundation.WIN32_ERROR.ERROR_INSUFFICIENT_BUFFER)
+            {
+                // this is the expected error condition; we'll resize our buffer to match requiredPropertyKeyCount
+            }
+            else
+            {
+                return Result.ErrorResult<IWin32Error>(IWin32Error.FromInt32(win32ErrorCode));
+            }
+        }
+        else
+        {
+            // return an error if requiredPropertyKeyCount is non-zero; otherwise, continue with the understanding that the property has a size of zero
+            if (requiredPropertyKeyCount > 0)
+            {
+                // we don't expect the operation to succeed with a null buffer and zero-length buffer size (unless there are no elements to return)
+                Debug.Assert(false, "SetupDiGetXXXPropertyKeys succeeded, even though we passed it no buffer.");
+                return Result.ErrorResult<IWin32Error>(new IWin32Error.Win32Error((ushort)Windows.Win32.Foundation.WIN32_ERROR.ERROR_INVALID_DATA));
+            }
+        }
+
+        return Result.OkResult();
+    }
+
+    private static Result<List<Windows.Win32.Devices.Properties.DEVPROPKEY>, IWin32Error> GetDeviceClassPropertyKeys(System.Guid classGuid, DeviceClassType classType)
+    {
+        uint flags;
+        switch (classType)
+        {
+            case DeviceClassType.DeviceSetupClass:
+                flags = Windows.Win32.PInvoke.DICLASSPROP_INSTALLER;
+                break;
+            case DeviceClassType.DeviceInterfaceClass:
+                flags = Windows.Win32.PInvoke.DICLASSPROP_INTERFACE;
+                break;
+            default:
+                throw new Exception("invalid code path");
+        }
+
+        // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetclasspropertykeys
+        bool getClassPropertyKeysResult;
+        uint requiredPropertyKeyCount = 0;
+        unsafe
+        {
+            getClassPropertyKeysResult = Windows.Win32.PInvoke.SetupDiGetClassPropertyKeys(classGuid, null, &requiredPropertyKeyCount, flags);
+        }
+        var checkRequiredSizeResult = PnpEnumerator.CheckSetupDiGetXXXPropertyKeysRequiredSizeResult(getClassPropertyKeysResult, requiredPropertyKeyCount);
+        if (checkRequiredSizeResult.IsError) { return Result.ErrorResult(checkRequiredSizeResult.Error!); }
+
+        // retrieve the property keys
+        Span<Windows.Win32.Devices.Properties.DEVPROPKEY> propertyKeyArrayAsSpan = stackalloc Windows.Win32.Devices.Properties.DEVPROPKEY[(int)requiredPropertyKeyCount];
+        propertyKeyArrayAsSpan.Fill(new Windows.Win32.Devices.Properties.DEVPROPKEY() { fmtid = System.Guid.Empty, pid = 0 });
+        //
+        unsafe
+        {
+            getClassPropertyKeysResult = Windows.Win32.PInvoke.SetupDiGetClassPropertyKeys(classGuid, propertyKeyArrayAsSpan, null, flags);
+        }
+        if (getClassPropertyKeysResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            return Result.ErrorResult<IWin32Error>(IWin32Error.FromInt32(win32ErrorCode));
+        }
+        var propertyKeysBufferAsList = new List<Windows.Win32.Devices.Properties.DEVPROPKEY>(propertyKeyArrayAsSpan.ToArray());
+
+        return Result.OkResult(propertyKeysBufferAsList);
+    }
+
+    private static Result<List<Windows.Win32.Devices.Properties.DEVPROPKEY>, IWin32Error> GetDeviceInstancePropertyKeys(Windows.Win32.SetupDiDestroyDeviceInfoListSafeHandle handleToDeviceInfoSet, Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVINFO_DATA deviceInfoData)
+    {
+        // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdevicepropertykeys
+        bool getDeviceInstancePropertyKeysResult;
+        uint requiredPropertyKeyCount = 0;
+        unsafe
+        {
+            getDeviceInstancePropertyKeysResult = Windows.Win32.PInvoke.SetupDiGetDevicePropertyKeys(handleToDeviceInfoSet, deviceInfoData, null, &requiredPropertyKeyCount, 0);
+        }
+        var checkRequiredSizeResult = PnpEnumerator.CheckSetupDiGetXXXPropertyKeysRequiredSizeResult(getDeviceInstancePropertyKeysResult, requiredPropertyKeyCount);
+        if (checkRequiredSizeResult.IsError) { return Result.ErrorResult(checkRequiredSizeResult.Error!); }
+
+        // retrieve the property keys
+        Span<Windows.Win32.Devices.Properties.DEVPROPKEY> propertyKeyArrayAsSpan = stackalloc Windows.Win32.Devices.Properties.DEVPROPKEY[(int)requiredPropertyKeyCount];
+        propertyKeyArrayAsSpan.Fill(new Windows.Win32.Devices.Properties.DEVPROPKEY() { fmtid = Guid.Empty, pid = 0 });
+        //
+        unsafe
+        {
+            getDeviceInstancePropertyKeysResult = Windows.Win32.PInvoke.SetupDiGetDevicePropertyKeys(handleToDeviceInfoSet, deviceInfoData, propertyKeyArrayAsSpan, null, 0);
+        }
+        if (getDeviceInstancePropertyKeysResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            return Result.ErrorResult<IWin32Error>(IWin32Error.FromInt32(win32ErrorCode));
+        }
+        var propertyKeysBufferAsList = new List<Windows.Win32.Devices.Properties.DEVPROPKEY>(propertyKeyArrayAsSpan.ToArray());
+
+        return Result.OkResult(propertyKeysBufferAsList);
+    }
+
+    private static Result<List<Windows.Win32.Devices.Properties.DEVPROPKEY>, IWin32Error> GetDeviceInterfacePropertyKeys(Windows.Win32.SetupDiDestroyDeviceInfoListSafeHandle handleToDeviceInfoSet, Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DATA deviceInterfaceData)
+    {
+        // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceinterfacepropertykeys
+        bool getDeviceInterfacePropertyKeysResult;
+        uint requiredPropertyKeyCount = 0;
+        unsafe
+        {
+            getDeviceInterfacePropertyKeysResult = Windows.Win32.PInvoke.SetupDiGetDeviceInterfacePropertyKeys(handleToDeviceInfoSet, deviceInterfaceData, null, &requiredPropertyKeyCount, 0);
+        }
+        var checkRequiredSizeResult = PnpEnumerator.CheckSetupDiGetXXXPropertyKeysRequiredSizeResult(getDeviceInterfacePropertyKeysResult, requiredPropertyKeyCount);
+        if (checkRequiredSizeResult.IsError) { return Result.ErrorResult(checkRequiredSizeResult.Error!); }
+
+        // retrieve the property keys
+        Span<Windows.Win32.Devices.Properties.DEVPROPKEY> propertyKeyArrayAsSpan = stackalloc Windows.Win32.Devices.Properties.DEVPROPKEY[(int)requiredPropertyKeyCount];
+        propertyKeyArrayAsSpan.Fill(new Windows.Win32.Devices.Properties.DEVPROPKEY() { fmtid = Guid.Empty, pid = 0 });
+        //
+        unsafe
+        {
+            getDeviceInterfacePropertyKeysResult = Windows.Win32.PInvoke.SetupDiGetDeviceInterfacePropertyKeys(handleToDeviceInfoSet, deviceInterfaceData, propertyKeyArrayAsSpan, null, 0);
+        }
+        if (getDeviceInterfacePropertyKeysResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            return Result.ErrorResult<IWin32Error>(IWin32Error.FromInt32(win32ErrorCode));
+        }
+        var propertyKeysBufferAsList = new List<Windows.Win32.Devices.Properties.DEVPROPKEY>(propertyKeyArrayAsSpan.ToArray());
+
+        return Result.OkResult(propertyKeysBufferAsList);
+    }
+
+    //
+
     internal interface IGetDevicePropertyValueError
     {
         public record StringDecodingError() : IGetDevicePropertyValueError;
@@ -410,8 +928,8 @@ public class PnpEnumerator
         }
         else
         {
-            // we don't expect the operation to succeed with a null buffer and zero-length buffer size.
-            Debug.Assert(false, "SetupDiGetDeviceXXXPropertyResultW succeeded, even though we passed it no buffer.");
+            // we don't expect the operation to succeed with a null buffer and zero-length buffer size (as all known/supported property types have a non-zero length).
+            Debug.Assert(false, "SetupDiGetDeviceXXXPropertyW succeeded, even though we passed it no buffer.");
 
             // return an error if requiredSize is non-zero; otherwise, continue with the understanding that the property has a size of zero
             if (requiredSize > 0)
@@ -421,6 +939,123 @@ public class PnpEnumerator
         }
 
         return Result.OkResult();
+    }
+
+    private static Result<IPnpDevicePropertyValue, IGetDevicePropertyValueError> GetDeviceClassPropertyValue(Guid classGuid, DeviceClassType classType, PnpDevicePropertyKey propertyKey)
+    {
+        uint flags;
+        switch (classType)
+        {
+            case DeviceClassType.DeviceSetupClass:
+                flags = Windows.Win32.PInvoke.DICLASSPROP_INSTALLER;
+                break;
+            case DeviceClassType.DeviceInterfaceClass:
+                flags = Windows.Win32.PInvoke.DICLASSPROP_INTERFACE;
+                break;
+            default:
+                throw new Exception("invalid code path");
+        }
+        //
+        var propertyKeyAsDevpropkey = propertyKey.ToDevpropkey();
+
+        // get the type and size of the device setup/interface class property
+        // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetclasspropertyw
+        Windows.Win32.Devices.Properties.DEVPROPTYPE propertyType;
+        uint requiredSize = 0;
+        bool getClassPropertyResult;
+        unsafe
+        {
+            getClassPropertyResult = Windows.Win32.PInvoke.SetupDiGetClassProperty(classGuid, propertyKeyAsDevpropkey, out propertyType, null, &requiredSize, flags);
+        }
+        var checkRequiredSizeResult = PnpEnumerator.CheckSetupDiGetDeviceXXXPropertyRequiredSizeResult(getClassPropertyResult, requiredSize);
+        if (checkRequiredSizeResult.IsError) { return Result.ErrorResult(checkRequiredSizeResult.Error!); }
+
+        // retrieve the property value
+        Span<byte> propertyBufferAsSpan = stackalloc byte[(int)requiredSize];
+        propertyBufferAsSpan.Clear(); // .Fill(0);
+        unsafe
+        {
+            getClassPropertyResult = Windows.Win32.PInvoke.SetupDiGetClassProperty(classGuid, propertyKeyAsDevpropkey, out propertyType, propertyBufferAsSpan, null, flags);
+        }
+        if (getClassPropertyResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            return Result.ErrorResult(IGetDevicePropertyValueError.FromIWin32Error(IWin32Error.FromInt32(win32ErrorCode)));
+        }
+
+        // convert the property buffer into a property value
+        var propertyValueOrErrorResult = PnpEnumerator.ConvertPropertyBufferIntoDevicePropertyValue(propertyBufferAsSpan.ToArray(), propertyType);
+        return propertyValueOrErrorResult;
+    }
+
+    private static Result<IPnpDevicePropertyValue, IGetDevicePropertyValueError> GetDeviceInstancePropertyValue(Windows.Win32.SetupDiDestroyDeviceInfoListSafeHandle handleToDeviceInfoSet, Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVINFO_DATA devinfoData, PnpDevicePropertyKey propertyKey)
+    {
+        var propertyKeyAsDevpropkey = propertyKey.ToDevpropkey();
+
+        // get the type and size of the device instance property
+        // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdevicepropertyw
+        Windows.Win32.Devices.Properties.DEVPROPTYPE propertyType;
+        uint requiredSize = 0;
+        bool getDevicePropertyResult;
+        unsafe
+        {
+            getDevicePropertyResult = Windows.Win32.PInvoke.SetupDiGetDeviceProperty(handleToDeviceInfoSet, devinfoData, propertyKeyAsDevpropkey, out propertyType, null, &requiredSize, 0);
+        }
+        var checkRequiredSizeResult = PnpEnumerator.CheckSetupDiGetDeviceXXXPropertyRequiredSizeResult(getDevicePropertyResult, requiredSize);
+        if (checkRequiredSizeResult.IsError) { return Result.ErrorResult(checkRequiredSizeResult.Error!); }
+
+        // retrieve the property value
+        Span<byte> propertyBufferAsSpan = stackalloc byte[(int)requiredSize];
+        propertyBufferAsSpan.Clear(); // .Fill(0);
+        unsafe
+        {
+            getDevicePropertyResult = Windows.Win32.PInvoke.SetupDiGetDeviceProperty(handleToDeviceInfoSet, devinfoData, propertyKeyAsDevpropkey, out propertyType, propertyBufferAsSpan, null, 0);
+        }
+        if (getDevicePropertyResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            return Result.ErrorResult(IGetDevicePropertyValueError.FromIWin32Error(IWin32Error.FromInt32(win32ErrorCode)));
+        }
+
+        // convert the property buffer into a property value
+        var propertyValueOrErrorResult = PnpEnumerator.ConvertPropertyBufferIntoDevicePropertyValue(propertyBufferAsSpan.ToArray(), propertyType);
+
+        return propertyValueOrErrorResult;
+    }
+
+    private static Result<IPnpDevicePropertyValue, IGetDevicePropertyValueError> GetDeviceInterfacePropertyValue(Windows.Win32.SetupDiDestroyDeviceInfoListSafeHandle handleToDeviceInfoSet, Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DATA deviceInterfaceData, PnpDevicePropertyKey propertyKey)
+    {
+        var propertyKeyAsDevpropkey = propertyKey.ToDevpropkey();
+
+        // get the type and size of the device interface property
+        // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceinterfacepropertyw
+        Windows.Win32.Devices.Properties.DEVPROPTYPE propertyType;
+        uint requiredSize = 0;
+        bool getDeviceInterfacePropertyResult;
+        unsafe
+        {
+            getDeviceInterfacePropertyResult = Windows.Win32.PInvoke.SetupDiGetDeviceInterfaceProperty(handleToDeviceInfoSet, deviceInterfaceData, propertyKeyAsDevpropkey, out propertyType, null, &requiredSize, 0);
+        }
+        var checkRequiredSizeResult = PnpEnumerator.CheckSetupDiGetDeviceXXXPropertyRequiredSizeResult(getDeviceInterfacePropertyResult, requiredSize);
+        if (checkRequiredSizeResult.IsError) { return Result.ErrorResult(checkRequiredSizeResult.Error!); }
+
+        // retrieve the property value
+        Span<byte> propertyBufferAsSpan = stackalloc byte[(int)requiredSize];
+        propertyBufferAsSpan.Clear(); // .Fill(0);
+        unsafe
+        {
+            getDeviceInterfacePropertyResult = Windows.Win32.PInvoke.SetupDiGetDeviceInterfaceProperty(handleToDeviceInfoSet, deviceInterfaceData, propertyKeyAsDevpropkey, out propertyType, propertyBufferAsSpan, null, 0);
+        }
+        if (getDeviceInterfacePropertyResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            return Result.ErrorResult(IGetDevicePropertyValueError.FromIWin32Error(IWin32Error.FromInt32(win32ErrorCode)));
+        }
+
+        // convert the property buffer into a property value
+        var propertyValueOrErrorResult = PnpEnumerator.ConvertPropertyBufferIntoDevicePropertyValue(propertyBufferAsSpan.ToArray(), propertyType);
+
+        return propertyValueOrErrorResult;
     }
 
     //
@@ -440,7 +1075,7 @@ public class PnpEnumerator
         var checkRequiredSizeResult = PnpEnumerator.CheckSetupDiGetDeviceXXXPropertyRequiredSizeResult(getDeviceRegistryPropertyResult, requiredSize);
         if (checkRequiredSizeResult.IsError) { return Result.ErrorResult(checkRequiredSizeResult.Error!); }
 
-        // retrieve the property
+        // retrieve the property value
         Span<byte> propertyBufferAsSpan = stackalloc byte[(int)requiredSize];
         propertyBufferAsSpan.Clear(); // .Fill(0);
         unsafe
@@ -524,12 +1159,12 @@ public class PnpEnumerator
                         case (uint)Windows.Win32.Devices.Properties.DEVPROPTYPE.DEVPROP_TYPE_GUID:
                         case (uint)Windows.Win32.Devices.Properties.DEVPROPTYPE.DEVPROP_TYPE_UINT16:
                         case (uint)Windows.Win32.Devices.Properties.DEVPROPTYPE.DEVPROP_TYPE_UINT32:
-                            // these fixed-length value types are allowed
+                            // these fixed-size value types are allowed
                             propertyValueIsArray = true;
                             break;
                         default:
                             // no other types are allowed
-                            Debug.Assert(false, "Device type mod should only be applied to string types; do we have a new string type to handle?");
+                            Debug.Assert(false, "Device type mod should only be applied to fixed-size value types; do we have a new fixed-size value type to handle?");
                             return Result.OkResult<IPnpDevicePropertyValue>(new IPnpDevicePropertyValue.UnsupportedPropertyDataType((uint)propertyType));
                     }
                 }
@@ -552,7 +1187,7 @@ public class PnpEnumerator
                 }
                 break;
             default:
-                // if there are any property type mods which we don't handle, return UnsupportedType (and assert during debug, so we know there are new mods to handle)
+                // if there are any property type mods which we don't handle, return UnsupportedPropertyDataType (and assert during debug, so we know there are new mods to handle)
                 Debug.Assert(false, "Unhandled device type mod");
                 return Result.OkResult<IPnpDevicePropertyValue>(new IPnpDevicePropertyValue.UnsupportedPropertyDataType((uint)propertyType));
         }
@@ -668,6 +1303,7 @@ public class PnpEnumerator
                         }
                         else
                         {
+                            // if the last character was not a null terminator, return an error
                             return Result.ErrorResult<IGetDevicePropertyValueError>(new IGetDevicePropertyValueError.StringListTerminationError());
                         }
                         propertyValueAsUtf16Chars.RemoveAt(propertyValueAsUtf16Chars.Count - 1);
@@ -682,6 +1318,7 @@ public class PnpEnumerator
                             }
                             else
                             {
+                                // if the last character was not a null terminator, return an error
                                 return Result.ErrorResult<IGetDevicePropertyValueError>(new IGetDevicePropertyValueError.StringTerminationError());
                             }
                         }
@@ -726,6 +1363,7 @@ public class PnpEnumerator
                         }
                         else
                         {
+                            // if the last character was not a null terminator, return an error
                             return Result.ErrorResult<IGetDevicePropertyValueError>(new IGetDevicePropertyValueError.StringTerminationError());
                         }
 
@@ -791,5 +1429,86 @@ public class PnpEnumerator
         var result = 0xFFFF_FFFFu >> numberOfHighZeroBits;
 
         return result;
+    }
+
+    //
+
+    private static Result<string, IWin32Error> GetDevicePathFromDeviceInterfaceDetailData(Windows.Win32.SetupDiDestroyDeviceInfoListSafeHandle handleToDeviceInfoSet, ref Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DATA deviceInterfaceData)
+    {
+        string devicePath;
+
+        // get the size of the SP_DEVICE_INTERFACE_DETAIL_DATA_W structure required to contain the device path; we'll get an error code of ERROR_INSUFFICIENT_BUFFER and the required_size parameter will contain the required size
+        // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceinterfacedetailw
+        uint requiredSize = 0;
+        //
+        bool getDeviceInterfaceDetailResult;
+        unsafe
+        {
+            getDeviceInterfaceDetailResult = Windows.Win32.PInvoke.SetupDiGetDeviceInterfaceDetail(handleToDeviceInfoSet, deviceInterfaceData, null, 0, &requiredSize, null);
+        }
+        if (getDeviceInterfaceDetailResult == false)
+        {
+            var win32ErrorCode = Marshal.GetLastWin32Error();
+            if ((Windows.Win32.Foundation.WIN32_ERROR)win32ErrorCode == Windows.Win32.Foundation.WIN32_ERROR.ERROR_INSUFFICIENT_BUFFER)
+            {
+                // this is the expected error (i.e. the error we intentionally induced); continue
+            }
+            else
+            {
+                return Result.ErrorResult<IWin32Error>(IWin32Error.FromInt32(win32ErrorCode));
+            }
+        }
+        else
+        {
+            Debug.Assert(false, "SetupDiGetDeviceInterfaceDetail returned success when we asked it for the required buffer size; it should always return false in this circumstance");
+            return Result.ErrorResult<IWin32Error>(new IWin32Error.Win32Error((ushort)Windows.Win32.Foundation.WIN32_ERROR.ERROR_INVALID_DATA));
+        }
+        //
+        // manually allocate memory for the SP_DEVICE_INTERFACE_DETAIL_DATA_W struct (as it has an ANYSIZE_ARRAY for the [u16] DevicePath)
+        // NOTE: Jan Axelson's "USB Complete 5th ed., p. 253" says to use a size of 8 for 64-bit Windows; if we get errors, we may choose to manually set this to 8 in the future
+        uint sizeOfStruct = Marshal.SizeOf<nuint>() switch
+        {
+            4 => (uint)(Marshal.SizeOf<uint>() + Marshal.SizeOf<ushort>()),
+            _ => (uint)(Marshal.SizeOf<Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DETAIL_DATA_W>()),
+        };
+        Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DETAIL_DATA_W deviceInterfaceDetailData = new() { cbSize = sizeOfStruct };
+        //
+        var pointerToDeviceInterfaceDetailData = Marshal.AllocHGlobal((int)requiredSize);
+        Marshal.StructureToPtr(deviceInterfaceDetailData, pointerToDeviceInterfaceDetailData, false);
+        try
+        {
+            unsafe
+            {
+                getDeviceInterfaceDetailResult = Windows.Win32.PInvoke.SetupDiGetDeviceInterfaceDetail(handleToDeviceInfoSet, deviceInterfaceData, (Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DETAIL_DATA_W*)pointerToDeviceInterfaceDetailData.ToPointer(), requiredSize, null, null);
+            }
+            if (getDeviceInterfaceDetailResult == false)
+            {
+                var win32ErrorCode = Marshal.GetLastWin32Error();
+                return Result.ErrorResult<IWin32Error>(IWin32Error.FromInt32(win32ErrorCode));
+            }
+
+            // sanity check: required_size must be greater than 6 (32-bit) or 10 (64-bit)
+            if (requiredSize < (uint)(Marshal.SizeOf<uint>() /* sizeof(.cbSize) */ + Marshal.SizeOf<ushort>() /* sizeof(u16...null terminator) */))
+            {
+                return Result.ErrorResult<IWin32Error>(new IWin32Error.Win32Error((int)Windows.Win32.Foundation.WIN32_ERROR.ERROR_INVALID_DATA));
+            }
+
+            // capture the device interface detail data (which is just the structure size plus the first character of the device path)
+            deviceInterfaceDetailData = Marshal.PtrToStructure<Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DETAIL_DATA_W>(pointerToDeviceInterfaceDetailData);
+            //
+            // capture the device's path; it's already stored in deviceInterfaceData.DevicePath, but that's as a char*; we want to return it as a string instead
+            // NOTE: we could use reflection to get the DevicePath, but we are assuming that its location will stay fixed (i.e. located immediately after the cbSize field); the reflection-based alternative is commented out here in case we need it in the future
+            //var offsetOfDevicePath = Marshal.OffsetOf<Windows.Win32.Devices.DeviceAndDriverInstallation.SP_DEVICE_INTERFACE_DETAIL_DATA_W>("DevicePath");
+            var offsetOfDevicePath = Marshal.SizeOf(deviceInterfaceDetailData.cbSize);
+            //
+            var pointerToDevicePath = pointerToDeviceInterfaceDetailData + offsetOfDevicePath;
+            devicePath = Marshal.PtrToStringUni(pointerToDevicePath)!;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pointerToDeviceInterfaceDetailData);
+        }
+
+        return Result.OkResult(devicePath);
     }
 }
